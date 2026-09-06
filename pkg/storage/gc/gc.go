@@ -139,8 +139,11 @@ func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
 		return zerr.ErrRepoNotFound
 	}
 
-	gc.imgStore.Lock(&lockLatency)
-	defer gc.imgStore.Unlock(&lockLatency)
+	// Scoped to this repo unless a dedupe cache makes blobs cross-repo; see
+	// ImageStore.GCLock. Previously this took the store-wide write lock, so a GC
+	// pass over ANY repo blocked reads and writes of every other repo.
+	gc.imgStore.GCLock(repo, &lockLatency)
+	defer gc.imgStore.GCUnlock(repo, &lockLatency)
 
 	/* this index (which represents the index.json of this repo) is the root point from which we
 	search for dangling manifests/blobs
@@ -413,7 +416,7 @@ func (gc GarbageCollect) syncManifestRemoval(repo string, desc ispec.Descriptor,
 func (gc GarbageCollect) imageIndexHasStaleNestedManifests(repo string, desc ispec.Descriptor,
 	existingBlobs map[string]bool,
 ) (bool, error) {
-	indexImage, err := common.GetImageIndex(gc.imgStore, repo, desc.Digest, gc.log)
+	indexImage, err := common.GetImageIndexCached(gc.imgStore, repo, desc.Digest, gc.log)
 	if err != nil {
 		var pathNotFoundErr driver.PathNotFoundError
 		if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
@@ -551,7 +554,7 @@ func (gc GarbageCollect) removeReferrerByIndexDesc(repo string, rootIndex *ispec
 	if !cached {
 		var err error
 
-		indexImage, err = common.GetImageIndex(gc.imgStore, repo, desc.Digest, gc.log)
+		indexImage, err = common.GetImageIndexCached(gc.imgStore, repo, desc.Digest, gc.log)
 		if err != nil {
 			if isMissingBlobErr(err) {
 				missing[desc.Digest] = struct{}{}
@@ -590,7 +593,7 @@ func (gc GarbageCollect) removeReferrerByManifestDesc(repo string, rootIndex *is
 	if !cached {
 		var err error
 
-		image, err = common.GetImageManifest(gc.imgStore, repo, desc.Digest, gc.log)
+		image, err = common.GetImageManifestCached(gc.imgStore, repo, desc.Digest, gc.log)
 		if err != nil {
 			if isMissingBlobErr(err) {
 				missing[desc.Digest] = struct{}{}
@@ -906,6 +909,13 @@ func (gc GarbageCollect) removeUntaggedManifests(ctx context.Context, repo strin
 func (gc GarbageCollect) identifyManifestsReferencedInIndex(index ispec.Index, repo string,
 	referenced map[godigest.Digest]bool, seen map[godigest.Digest]struct{},
 ) error {
+	// ZOTPATCH-4350: warm the parse caches for this level concurrently so the
+	// sequential, order-sensitive walk below runs from memory. Without this the
+	// pass read every manifest and index one GCS round-trip at a time — ~4,800
+	// serial reads and 4-5 minutes under the repo lock on a 2,400-index CI repo,
+	// during which every push to that repo queued.
+	common.PrefetchParsedBlobs(gc.imgStore, repo, index.Manifests, gc.log)
+
 	for _, desc := range index.Manifests {
 		if _, ok := seen[desc.Digest]; ok {
 			continue
@@ -914,7 +924,7 @@ func (gc GarbageCollect) identifyManifestsReferencedInIndex(index ispec.Index, r
 		seen[desc.Digest] = struct{}{}
 
 		if common.IsImageIndexMediaType(desc.MediaType) {
-			indexImage, err := common.GetImageIndex(gc.imgStore, repo, desc.Digest, gc.log)
+			indexImage, err := common.GetImageIndexCached(gc.imgStore, repo, desc.Digest, gc.log)
 			if err != nil {
 				if isMissingBlobErr(err) {
 					gc.log.Warn().Err(err).Str("module", "gc").Str("repository", repo).
@@ -943,7 +953,7 @@ func (gc GarbageCollect) identifyManifestsReferencedInIndex(index ispec.Index, r
 				return err
 			}
 		} else if common.IsImageManifestMediaType(desc.MediaType) {
-			image, err := common.GetImageManifest(gc.imgStore, repo, desc.Digest, gc.log)
+			image, err := common.GetImageManifestCached(gc.imgStore, repo, desc.Digest, gc.log)
 			if err != nil {
 				if isMissingBlobErr(err) {
 					gc.log.Warn().Err(err).Str("module", "gc").Str("repo", repo).

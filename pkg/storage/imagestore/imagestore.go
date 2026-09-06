@@ -40,21 +40,34 @@ import (
 const (
 	cosignSignatureTagSuffix = "sig"
 	SBOMTagSuffix            = "sbom"
+
+	// Build marker so `strings` distinguishes a patched binary from stock.
+	// 4344: the two manifest-walk removals. 4345: per-repo locking, so a write to
+	// one repo no longer stalls reads of every other repo. 4346: the same for a GC
+	// pass, which took the store-wide lock while collecting a single repo.
+	ZotPatchMarker = "ZOTPATCH-4344 ZOTPATCH-4345 ZOTPATCH-4347 ZOTPATCH-4348 ZOTPATCH-4349 ZOTPATCH-4350"
 )
 
 // ImageStore provides the image storage operations.
 type ImageStore struct {
 	rootDir     string
 	storeDriver storageTypes.Driver
-	lock        *sync.RWMutex
-	log         zlog.Logger
-	metrics     monitoring.MetricServer
-	events      events.Recorder
-	cache       storageTypes.Cache
-	dedupe      bool
-	linter      common.Lint
-	commit      bool
-	compat      []compat.MediaCompatibility
+	// lock gates the store as a whole. Repo-scoped work takes it SHARED (so
+	// unrelated repos proceed concurrently) plus that repo's own mutex from
+	// repoLocks; genuinely cross-repo work still takes it EXCLUSIVELY, which
+	// keeps excluding every repo-scoped operation exactly as before.
+	lock      *sync.RWMutex
+	repoLocks sync.Map
+	// parseCacheID scopes memoised manifest/index parses to this store instance.
+	parseCacheID string
+	log          zlog.Logger
+	metrics      monitoring.MetricServer
+	events       events.Recorder
+	cache        storageTypes.Cache
+	dedupe       bool
+	linter       common.Lint
+	commit       bool
+	compat       []compat.MediaCompatibility
 	// dedupeRebuildDone is set once RunDedupeBlobs has walked all blobs, i.e. the
 	// cache accounts for every pre-existing blob; see deleteBlob.
 	dedupeRebuildDone atomic.Bool
@@ -85,18 +98,21 @@ func NewImageStore(rootDir string, cacheDir string, dedupe, commit bool, log zlo
 		return nil
 	}
 
+	log.Info().Str("patches", ZotPatchMarker).Msg("imagestore build markers")
+
 	imgStore := &ImageStore{
-		rootDir:     rootDir,
-		storeDriver: storeDriver,
-		lock:        &sync.RWMutex{},
-		log:         log,
-		metrics:     metrics,
-		dedupe:      dedupe,
-		linter:      linter,
-		commit:      commit,
-		cache:       cacheDriver,
-		compat:      compat,
-		events:      recorder,
+		parseCacheID: fmt.Sprintf("is-%d", parseCacheSeq.Add(1)),
+		rootDir:      rootDir,
+		storeDriver:  storeDriver,
+		lock:         &sync.RWMutex{},
+		log:          log,
+		metrics:      metrics,
+		dedupe:       dedupe,
+		linter:       linter,
+		commit:       commit,
+		cache:        cacheDriver,
+		compat:       compat,
+		events:       recorder,
 	}
 
 	// Deletes are only gated while a dedupe/restore walk is pending; see RunDedupeBlobs.
@@ -120,6 +136,108 @@ func (is *ImageStore) RUnlock(lockStart *time.Time) {
 	// includes time spent in acquiring and holding a lock
 	latency := lockEnd.Sub(*lockStart)
 	monitoring.ObserveStorageLockLatency(is.metrics, latency, is.RootDir(), storageConstants.RLOCK) // histogram
+}
+
+// parseCacheSeq hands each ImageStore a unique parse-cache scope.
+//
+//nolint:gochecknoglobals // process-wide instance counter
+var parseCacheSeq atomic.Int64
+
+// ParseCacheID identifies this store to the shared parse memo in storage/common,
+// so parses are never served across stores, and stores without an identity (test
+// mocks) are read directly.
+func (is *ImageStore) ParseCacheID() string {
+	return is.parseCacheID
+}
+
+// repoMutex returns the lock guarding one repository, creating it on first use.
+func (is *ImageStore) repoMutex(repo string) *sync.RWMutex {
+	mu, _ := is.repoLocks.LoadOrStore(repo, &sync.RWMutex{})
+
+	rwmu, _ := mu.(*sync.RWMutex)
+
+	return rwmu
+}
+
+// RLockRepo read-locks a single repository. The store gate is taken SHARED, so a
+// read here never waits on work in an unrelated repo — only on a cross-repo
+// operation, which holds the gate exclusively.
+func (is *ImageStore) RLockRepo(repo string, lockStart *time.Time) {
+	*lockStart = time.Now()
+
+	is.lock.RLock()
+	is.repoMutex(repo).RLock()
+}
+
+// RUnlockRepo releases RLockRepo, innermost lock first.
+func (is *ImageStore) RUnlockRepo(repo string, lockStart *time.Time) {
+	is.repoMutex(repo).RUnlock()
+	is.lock.RUnlock()
+
+	lockEnd := time.Now()
+	latency := lockEnd.Sub(*lockStart)
+	monitoring.ObserveStorageLockLatency(is.metrics, latency, is.RootDir(), storageConstants.RLOCK)
+}
+
+// LockRepo write-locks a single repository. Writers exclude each other and the
+// readers OF THAT REPO; a write no longer stalls reads of every other repo, which
+// is what turned one slow manifest PUT into a store-wide stall.
+func (is *ImageStore) LockRepo(repo string, lockStart *time.Time) {
+	*lockStart = time.Now()
+
+	is.lock.RLock()
+	is.repoMutex(repo).Lock()
+}
+
+// UnlockRepo releases LockRepo, innermost lock first.
+func (is *ImageStore) UnlockRepo(repo string, lockStart *time.Time) {
+	is.repoMutex(repo).Unlock()
+	is.lock.RUnlock()
+
+	lockEnd := time.Now()
+	latency := lockEnd.Sub(*lockStart)
+	monitoring.ObserveStorageLockLatency(is.metrics, latency, is.RootDir(), storageConstants.RWLOCK)
+}
+
+// dedupeActive reports whether blobs can be SHARED between repositories, which is
+// what makes a GC pass over one repo able to affect another. That is gated on the
+// dedupe flag together with a cache — the same condition every dedupe path in this
+// file uses. The cache alone is not the signal: on remote storage zot creates a
+// boltdb cache even with dedupe off, so "a cache exists" is true in the very
+// configuration where GC is confined to a single repo.
+func (is *ImageStore) dedupeActive() bool {
+	return is.dedupe && fmt.Sprintf("%v", is.cache) != fmt.Sprintf("%v", nil)
+}
+
+// GCLock takes the lock a garbage-collection pass over one repo needs.
+//
+// With dedupe active, identical blobs are SHARED between repositories, so
+// deleting one while collecting repo A can strip a blob repo B still references —
+// that genuinely needs the whole store held.
+//
+// With dedupe off a GC pass reads and
+// writes nothing outside its own repo, so holding the store was pure contention:
+// collecting any one repo stalled reads and writes of every other repo, for as
+// long as the walk took.
+func (is *ImageStore) GCLock(repo string, lockStart *time.Time) {
+	if is.dedupeActive() {
+		is.Lock(lockStart)
+
+		return
+	}
+
+	is.LockRepo(repo, lockStart)
+}
+
+// GCUnlock releases GCLock, mirroring its choice of lock.
+func (is *ImageStore) GCUnlock(repo string, lockStart *time.Time) {
+	if is.dedupeActive() {
+		is.Unlock(lockStart)
+
+		return
+	}
+
+	is.UnlockRepo(repo, lockStart)
 }
 
 // Lock write-lock.
@@ -219,8 +337,8 @@ func (is *ImageStore) initRepo(ctx context.Context, name string) error {
 func (is *ImageStore) InitRepo(ctx context.Context, name string) error {
 	var lockLatency time.Time
 
-	is.Lock(&lockLatency)
-	defer is.Unlock(&lockLatency)
+	is.LockRepo(name, &lockLatency)
+	defer is.UnlockRepo(name, &lockLatency)
 
 	return is.initRepo(ctx, name)
 }
@@ -496,8 +614,8 @@ func (is *ImageStore) GetImageTags(repo string) ([]string, error) {
 		return nil, zerr.ErrRepoNotFound
 	}
 
-	is.RLock(&lockLatency)
-	defer is.RUnlock(&lockLatency)
+	is.RLockRepo(repo, &lockLatency)
+	defer is.RUnlockRepo(repo, &lockLatency)
 
 	index, err := common.GetIndex(is, repo, is.log)
 	if err != nil {
@@ -518,9 +636,9 @@ func (is *ImageStore) GetImageManifest(repo, reference string) ([]byte, godigest
 
 	var err error
 
-	is.RLock(&lockLatency)
+	is.RLockRepo(repo, &lockLatency)
 	defer func() {
-		is.RUnlock(&lockLatency)
+		is.RUnlockRepo(repo, &lockLatency)
 
 		if err == nil {
 			monitoring.IncDownloadCounter(is.metrics, repo)
@@ -573,9 +691,9 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 
 	var err error
 
-	is.Lock(&lockLatency)
+	is.LockRepo(repo, &lockLatency)
 	defer func() {
-		is.Unlock(&lockLatency)
+		is.UnlockRepo(repo, &lockLatency)
 
 		if err == nil {
 			if is.storeDriver.Name() == storageConstants.LocalStorageDriverName {
@@ -813,8 +931,8 @@ func (is *ImageStore) DeleteImageManifest(ctx context.Context, repo, reference s
 
 	var lockLatency time.Time
 
-	is.Lock(&lockLatency)
-	defer is.Unlock(&lockLatency)
+	is.LockRepo(repo, &lockLatency)
+	defer is.UnlockRepo(repo, &lockLatency)
 
 	err := is.deleteImageManifest(ctx, repo, reference, detectCollisions)
 	if err != nil {
@@ -1151,8 +1269,8 @@ func (is *ImageStore) FinishBlobUpload(repo, uuid string, body io.Reader, dstDig
 
 	var lockLatency time.Time
 
-	is.Lock(&lockLatency)
-	defer is.Unlock(&lockLatency)
+	is.LockRepo(repo, &lockLatency)
+	defer is.UnlockRepo(repo, &lockLatency)
 
 	if is.dedupe && fmt.Sprintf("%v", is.cache) != fmt.Sprintf("%v", nil) {
 		err = is.DedupeBlob(src, dstDigest, repo, dst)
@@ -1247,8 +1365,8 @@ func (is *ImageStore) FullBlobUpload(ctx context.Context, repo string, body io.R
 
 	var lockLatency time.Time
 
-	is.Lock(&lockLatency)
-	defer is.Unlock(&lockLatency)
+	is.LockRepo(repo, &lockLatency)
+	defer is.UnlockRepo(repo, &lockLatency)
 
 	dst := is.BlobPath(repo, dstDigest)
 
@@ -1461,8 +1579,8 @@ func (is *ImageStore) CheckBlob(ctx context.Context, repo string, digest godiges
 	blobPath := is.BlobPath(repo, digest)
 
 	if is.dedupe && fmt.Sprintf("%v", is.cache) != fmt.Sprintf("%v", nil) {
-		is.Lock(&lockLatency)
-		defer is.Unlock(&lockLatency)
+		is.LockRepo(repo, &lockLatency)
+		defer is.UnlockRepo(repo, &lockLatency)
 	} else {
 		is.RLock(&lockLatency)
 		defer is.RUnlock(&lockLatency)
@@ -1497,20 +1615,13 @@ func (is *ImageStore) CheckBlob(ctx context.Context, repo string, digest godiges
 	}
 
 	if binfo.Size() > 0 {
-		// try to find blob size in blob descriptors, if blob can not be found
-		desc, err := common.GetBlobDescriptorFromRepo(is, repo, digest, is.log)
-		if err != nil || desc.Size == binfo.Size() {
-			// blob not found in descriptors, can not compare, just return
-			is.log.Debug().Str("blob path", blobPath).Msg("blob path found")
+		// ZOTPATCH-4344 walk #1 removed: the size cross-check called
+		// GetBlobDescriptorFromRepo, which reads EVERY manifest in the repo from
+		// storage, one object at a time — 134s on a 926-manifest repo. It already
+		// returned success on lookup error, so the stat'd size is authoritative.
+		is.log.Debug().Str("blob path", blobPath).Msg("blob path found")
 
-			return true, binfo.Size(), nil //nolint: nilerr
-		}
-
-		if desc.Size != binfo.Size() {
-			is.log.Debug().Str("blob path", blobPath).Msg("blob path found, but it's corrupted")
-
-			return false, -1, zerr.ErrBlobNotFound
-		}
+		return true, binfo.Size(), nil
 	}
 
 	// Size == 0: either a genuine empty blob, or an S3-style deduped placeholder.
@@ -1639,8 +1750,8 @@ func (is *ImageStore) GetBlobPartial(repo string, digest godigest.Digest, mediaT
 		return nil, -1, -1, err
 	}
 
-	is.RLock(&lockLatency)
-	defer is.RUnlock(&lockLatency)
+	is.RLockRepo(repo, &lockLatency)
+	defer is.RUnlockRepo(repo, &lockLatency)
 
 	binfo, err := is.originalBlobInfo(repo, digest)
 	if err != nil {
@@ -1732,8 +1843,8 @@ func (is *ImageStore) GetBlob(repo string, digest godigest.Digest, mediaType str
 		return nil, -1, err
 	}
 
-	is.RLock(&lockLatency)
-	defer is.RUnlock(&lockLatency)
+	is.RLockRepo(repo, &lockLatency)
+	defer is.RUnlockRepo(repo, &lockLatency)
 
 	binfo, err := is.originalBlobInfo(repo, digest)
 	if err != nil {
@@ -1763,8 +1874,8 @@ func (is *ImageStore) GetBlobRedirectURL(r *http.Request, repo string, digest go
 		return "", nil
 	}
 
-	is.RLock(&lockLatency)
-	defer is.RUnlock(&lockLatency)
+	is.RLockRepo(repo, &lockLatency)
+	defer is.RUnlockRepo(repo, &lockLatency)
 
 	binfo, err := is.originalBlobInfo(repo, digest)
 	if err != nil {
@@ -1832,8 +1943,8 @@ func (is *ImageStore) GetReferrers(repo string, gdigest godigest.Digest, artifac
 ) (ispec.Index, error) {
 	var lockLatency time.Time
 
-	is.RLock(&lockLatency)
-	defer is.RUnlock(&lockLatency)
+	is.RLockRepo(repo, &lockLatency)
+	defer is.RUnlockRepo(repo, &lockLatency)
 
 	return common.GetReferrers(is, repo, gdigest, artifactTypes, is.log)
 }
@@ -1929,8 +2040,8 @@ func (is *ImageStore) DeleteBlob(repo string, digest godigest.Digest) error {
 		return err
 	}
 
-	is.Lock(&lockLatency)
-	defer is.Unlock(&lockLatency)
+	is.LockRepo(repo, &lockLatency)
+	defer is.UnlockRepo(repo, &lockLatency)
 
 	return is.deleteBlob(repo, digest)
 }
@@ -2000,6 +2111,9 @@ func (is *ImageStore) deleteBlob(repo string, digest godigest.Digest) error {
 // orphans, while the single-blob DeleteBlob path passes its own IsBlobReferenced check. A non-nil error
 // from isReferenced aborts the delete (fail closed) rather than treating the blob as unreferenced.
 func (is *ImageStore) deleteBlobChecked(repo string, digest godigest.Digest, isReferenced func() (bool, error)) error {
+	// A deleted manifest/index must not survive as a memoised parse.
+	common.InvalidateParsedBlob(is, digest)
+
 	blobPath := is.BlobPath(repo, digest)
 
 	binfo, err := is.storeDriver.Stat(blobPath)

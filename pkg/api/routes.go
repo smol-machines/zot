@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -1064,20 +1063,11 @@ func resolveBlobResponseMediaType(
 	digest godigest.Digest,
 	logger log.Logger,
 ) string {
-	desc, err := storageCommon.GetBlobDescriptorFromRepo(imgStore, repo, digest, logger)
-	if err == nil && desc.MediaType != "" {
-		// Descriptor media types originate from manifest JSON and are not
-		// necessarily validated. Ensure we only emit a header-safe, parseable
-		// media type; otherwise fall back to application/octet-stream.
-		//
-		// ParseMediaType also strips parameters so we only propagate the base
-		// type (e.g. "application/vnd.oci.image.layer.v1.tar+gzip").
-		mediaType, _, parseErr := mime.ParseMediaType(desc.MediaType)
-		if parseErr == nil && mediaType != "" {
-			return mediaType
-		}
-	}
-
+	// ZOTPATCH-4344 walk #2 removed: discovering a Content-Type called
+	// GetBlobDescriptorFromRepo, a second full read of every manifest in the repo
+	// on the same request as walk #1. Removing only one halved latency (134s ->
+	// 50s); removing both took it to 0.024s. The octet-stream fallback below was
+	// already the documented behaviour whenever lookup failed.
 	return constants.BinaryMediaType
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"math/rand"
 	"path"
 	"slices"
@@ -342,6 +343,145 @@ func GetImageManifest(imgStore storageTypes.ImageStore, repo string, digest godi
 	return manifestContent, nil
 }
 
+// parseKey scopes a memoised parse to one store INSTANCE: a digest is immutable
+// content, but which store it was read from still matters for multi-store
+// deployments, and an instance id (rather than a root path) keeps test stores
+// and mocks from ever sharing entries.
+type parseKey struct {
+	store  string
+	digest godigest.Digest
+}
+
+// parseCacheOwner is implemented by real image stores. Anything else — mocks,
+// wrappers — is read directly with the exact pre-memo semantics, sequentially.
+type parseCacheOwner interface {
+	ParseCacheID() string
+}
+
+func parseKeyFor(imgStore storageTypes.ImageStore, digest godigest.Digest) (parseKey, bool) {
+	owner, ok := imgStore.(parseCacheOwner)
+	if !ok {
+		return parseKey{}, false
+	}
+
+	return parseKey{owner.ParseCacheID(), digest}, true
+}
+
+// GetImageIndexCached is GetImageIndex through a bounded, per-store memo. Only
+// the repo-wide WALKS use it — GC's referenced-set pass and the multi-arch prune
+// — because those are the paths that re-read thousands of immutable blobs.
+// Ordinary reads keep GetImageIndex's exact semantics.
+func GetImageIndexCached(imgStore storageTypes.ImageStore, repo string, digest godigest.Digest, log zlog.Logger,
+) (ispec.Index, error) {
+	key, cacheable := parseKeyFor(imgStore, digest)
+	if !cacheable {
+		return GetImageIndex(imgStore, repo, digest, log)
+	}
+
+	if cached, ok := parsedIndexCache.Get(key); ok {
+		return cached, nil
+	}
+
+	idx, err := GetImageIndex(imgStore, repo, digest, log)
+	if err != nil {
+		return idx, err
+	}
+
+	parsedIndexCache.Add(key, idx)
+
+	return idx, nil
+}
+
+// GetImageManifestCached is GetImageManifest through the same per-store memo.
+func GetImageManifestCached(imgStore storageTypes.ImageStore, repo string, digest godigest.Digest, log zlog.Logger,
+) (ispec.Manifest, error) {
+	key, cacheable := parseKeyFor(imgStore, digest)
+	if !cacheable {
+		return GetImageManifest(imgStore, repo, digest, log)
+	}
+
+	if cached, ok := parsedManifestCache.Get(key); ok {
+		return cached, nil
+	}
+
+	man, err := GetImageManifest(imgStore, repo, digest, log)
+	if err != nil {
+		return man, err
+	}
+
+	parsedManifestCache.Add(key, man)
+
+	return man, nil
+}
+
+// InvalidateParsedBlob drops any memoised index or manifest for a digest. Called
+// when a blob is deleted locally so a later lookup sees the miss rather than the
+// stale parse. Digests are only ever looked up from a freshly read index.json,
+// which GC rewrites before deleting, so this is defence in depth rather than the
+// primary guard.
+func InvalidateParsedBlob(imgStore storageTypes.ImageStore, digest godigest.Digest) {
+	key, cacheable := parseKeyFor(imgStore, digest)
+	if !cacheable {
+		return
+	}
+
+	parsedIndexCache.Remove(key)
+	parsedManifestCache.Remove(key)
+}
+
+// PrefetchParsedBlobs warms the index/manifest caches for the given descriptors
+// concurrently. A sequential walk over a large repo then runs from memory: GC's
+// referenced-set pass on a 2,400-index repo went from ~4,800 serial GCS reads,
+// ~4-5 minutes under the repo lock, to a bounded parallel fetch. Errors are not
+// returned — the walk that follows re-fetches and reports them in its own terms.
+func PrefetchParsedBlobs(imgStore storageTypes.ImageStore, repo string, descs []ispec.Descriptor, log zlog.Logger) {
+	// No identity means no memo and no concurrency: the caller's own sequential
+	// reads keep the exact original behaviour (and test doubles stay single-threaded).
+	if _, cacheable := parseKeyFor(imgStore, ""); !cacheable {
+		return
+	}
+
+	var wg sync.WaitGroup
+
+	sem := make(chan struct{}, pruneIndexReadParallelism)
+
+	for _, desc := range descs {
+		isIndex := IsImageIndexMediaType(desc.MediaType)
+		isManifest := IsImageManifestMediaType(desc.MediaType)
+
+		if !isIndex && !isManifest {
+			continue
+		}
+
+		key, _ := parseKeyFor(imgStore, desc.Digest)
+
+		if isIndex && parsedIndexCache.Contains(key) {
+			continue
+		}
+
+		if isManifest && parsedManifestCache.Contains(key) {
+			continue
+		}
+
+		wg.Add(1)
+
+		go func(dgst godigest.Digest, isIndex bool) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			if isIndex {
+				_, _ = GetImageIndexCached(imgStore, repo, dgst, log)
+			} else {
+				_, _ = GetImageManifestCached(imgStore, repo, dgst, log)
+			}
+		}(desc.Digest, isIndex)
+	}
+
+	wg.Wait()
+}
+
 func RemoveManifestDescByReference(index *ispec.Index, reference string, detectCollisions bool,
 ) (ispec.Descriptor, error) {
 	var removedManifest ispec.Descriptor
@@ -427,6 +567,80 @@ func UpdateIndexWithPrunedImageManifests(imgStore storageTypes.ImageStore, index
 	return nil
 }
 
+// pruneIndexReadParallelism bounds concurrent index-blob reads in
+// PruneImageManifestsFromIndex. Remote drivers are latency-bound, so a modest
+// fan-out collapses a long sequential walk without swamping the backend.
+const pruneIndexReadParallelism = 32
+
+// parsedIndexCache memoises image indexes by digest for the prune walk. Bounded
+// so a large fleet of repos cannot grow it without limit; entries are a few KB.
+//
+//nolint:gochecknoglobals // a process-wide, content-addressed cache by design
+var parsedIndexCache, _ = lru.New[parseKey, ispec.Index](8192)
+
+// parsedManifestCache is the image-manifest counterpart of parsedIndexCache.
+//
+//nolint:gochecknoglobals // a process-wide, content-addressed cache by design
+var parsedManifestCache, _ = lru.New[parseKey, ispec.Manifest](16384)
+
+// readImageIndexesConcurrently fetches and parses the given image indexes, in
+// parallel and through parsedIndexCache. Missing blobs are skipped with a
+// warning, exactly as the sequential loop did; any other error aborts.
+func readImageIndexesConcurrently(imgStore storageTypes.ImageStore, repo string,
+	descs []ispec.Descriptor, log zlog.Logger,
+) ([]ispec.Index, error) {
+	results := make([]*ispec.Index, len(descs))
+	errs := make([]error, len(descs))
+
+	var wg sync.WaitGroup
+
+	sem := make(chan struct{}, pruneIndexReadParallelism)
+
+	for i, desc := range descs {
+		wg.Add(1)
+
+		go func(i int, dgst godigest.Digest) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			idx, err := GetImageIndexCached(imgStore, repo, dgst, log)
+			if err != nil {
+				errs[i] = err
+
+				return
+			}
+
+			results[i] = &idx
+		}(i, desc.Digest)
+	}
+
+	wg.Wait()
+
+	out := make([]ispec.Index, 0, len(descs))
+
+	for i, desc := range descs {
+		if err := errs[i]; err != nil {
+			var pathNotFoundErr driver.PathNotFoundError
+			if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
+				log.Warn().Err(err).Str("repository", repo).Str("digest", desc.Digest.String()).
+					Msg("skipping missing image index blob, continuing with other indexes")
+
+				continue
+			}
+
+			return nil, err
+		}
+
+		if results[i] != nil {
+			out = append(out, *results[i])
+		}
+	}
+
+	return out, nil
+}
+
 // PruneImageManifestsFromIndex is a helper routine that prunes image manifests from an index.
 // Before an image index manifest is pushed to a repo, its constituent manifests
 // are pushed first, so when updating/removing this image index manifest, we also
@@ -457,21 +671,27 @@ func PruneImageManifestsFromIndex(imgStore storageTypes.ImageStore, repo string,
 		inUse[manifest.Digest.Encoded()]++
 	}
 
-	for _, otherIndex := range otherImgIndexes {
-		oindex, err := GetImageIndex(imgStore, repo, otherIndex.Digest, log)
-		if err != nil {
-			// Handle missing blobs gracefully - log warning and continue with other indexes
-			var pathNotFoundErr driver.PathNotFoundError
-			if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
-				log.Warn().Err(err).Str("repository", repo).Str("digest", otherIndex.Digest.String()).
-					Msg("skipping missing image index blob, continuing with other indexes")
+	// ZOTPATCH-4349. Every OTHER image index in the repo has to be read to learn
+	// which of the old index's constituents it still references. That is one
+	// storage read per index, and on a repo where CI overwrites a multi-arch tag
+	// per build the index count only grows: 2,400 sequential GCS reads took
+	// 55-69s per push, held under the repo's write lock. Two changes, neither of
+	// which alters what gets pruned:
+	//
+	//   1. The reads run concurrently (bounded), so cold cost is ~N/parallelism.
+	//   2. Parsed indexes are memoised by digest. Blobs are content-addressed, so
+	//      a digest can never map to different content; a warm overwrite reads
+	//      only indexes it has not seen. The one behavioural edge is a blob
+	//      deleted since it was cached: it still counts as referencing its
+	//      constituents, which RETAINS a manifest that could have been pruned.
+	//      That errs on the side of keeping data, and the retention/GC pass
+	//      removes untagged manifests on its own schedule regardless.
+	otherIndexes, err := readImageIndexesConcurrently(imgStore, repo, otherImgIndexes, log)
+	if err != nil {
+		return nil, err
+	}
 
-				continue
-			}
-
-			return nil, err
-		}
-
+	for _, oindex := range otherIndexes {
 		for _, omanifest := range oindex.Manifests {
 			_, ok := inUse[omanifest.Digest.Encoded()]
 			if ok {
@@ -690,6 +910,9 @@ func IsImageManifestMediaType(mediaType string) bool {
 func collectReferencedBlobs(imgStore storageTypes.ImageStore, repo string,
 	index ispec.Index, referenced map[godigest.Digest]struct{}, seen map[godigest.Digest]struct{}, log zlog.Logger,
 ) error {
+	// ZOTPATCH-4350: warm the parse memo concurrently, then walk from memory.
+	PrefetchParsedBlobs(imgStore, repo, index.Manifests, log)
+
 	for _, desc := range index.Manifests {
 		referenced[desc.Digest] = struct{}{}
 
@@ -701,7 +924,7 @@ func collectReferencedBlobs(imgStore storageTypes.ImageStore, repo string,
 
 		switch {
 		case IsImageIndexMediaType(desc.MediaType):
-			indexImage, err := GetImageIndex(imgStore, repo, desc.Digest, log)
+			indexImage, err := GetImageIndexCached(imgStore, repo, desc.Digest, log)
 			if err != nil {
 				var pathNotFoundErr driver.PathNotFoundError
 				if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
@@ -721,7 +944,7 @@ func collectReferencedBlobs(imgStore storageTypes.ImageStore, repo string,
 				return err
 			}
 		case IsImageManifestMediaType(desc.MediaType):
-			manifestContent, err := GetImageManifest(imgStore, repo, desc.Digest, log)
+			manifestContent, err := GetImageManifestCached(imgStore, repo, desc.Digest, log)
 			if err != nil {
 				var pathNotFoundErr driver.PathNotFoundError
 				if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {

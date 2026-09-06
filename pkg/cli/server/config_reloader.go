@@ -2,10 +2,13 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 
@@ -65,6 +68,23 @@ func initShutDownRoutine(ctlr *api.Controller, hr *HotReloader) {
 
 	// handle SIGINT and SIGHUP.
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+
+	// ZOTPATCH-4348: SIGUSR1 writes every goroutine's stack to stderr WITHOUT
+	// stopping the server. signal.Ignore() above swallows SIGQUIT, so the Go
+	// runtime's own dump can never fire, and /v2/_zot/pprof sits behind auth in
+	// production. Diagnosing a stall needs a stack trace from the live process;
+	// this makes one a `kill -USR1` away with no restart and no dropped requests.
+	dumpCh := make(chan os.Signal, 1)
+	signal.Notify(dumpCh, syscall.SIGUSR1)
+
+	go func() {
+		for range dumpCh {
+			buf := make([]byte, 64<<20)
+			n := runtime.Stack(buf, true)
+			fmt.Fprintf(os.Stderr, "=== GOROUTINE DUMP (SIGUSR1) %s ===\n%s\n=== END GOROUTINE DUMP ===\n",
+				time.Now().UTC().Format(time.RFC3339), buf[:n])
+		}
+	}()
 }
 
 func (hr *HotReloader) Stop() {
